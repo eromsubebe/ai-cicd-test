@@ -1,0 +1,186 @@
+name: AI-Powered CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Allows manual triggering
+
+env:
+  PROJECT_ID: eromsdevops-agent
+  REGION: us-central1
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    outputs:
+      test_failed: ${{ steps.tests.outputs.failed }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run Tests
+        id: tests
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pytest tests/ -v --tb=short 2>&1 | tee test_output.log
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+          
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "failed=true" >> $GITHUB_OUTPUT
+            echo "::error::Tests failed with exit code $TEST_EXIT_CODE"
+          else
+            echo "failed=false" >> $GITHUB_OUTPUT
+            echo "::notice::All tests passed!"
+          fi
+      
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: test_output.log
+          retention-days: 7
+
+  ai-analysis:
+    name: AI Failure Analysis
+    needs: test
+    if: needs.test.outputs.test_failed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          # === CHOOSE ONE AUTHENTICATION METHOD ===
+          
+          # Option A: JSON Key (for testing)
+         # credentials_json: '${{ secrets.GCP_SA_KEY }}'
+          
+          # Option B: Workload Identity (for production)
+          # Uncomment these and comment out credentials_json above:
+          workload_identity_provider: 'projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'github-actions-agent@eromsdevops-agent.iam.gserviceaccount.com'
+          
+          token_format: access_token
+      
+      - name: Download test logs
+        uses: actions/download-artifact@v4
+        with:
+          name: test-logs
+      
+      - name: 🧠 Analyze Failure with Gemini
+        id: ai_analysis
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          echo "::group::📋 Preparing AI Analysis Request"
+          
+          # Read the test output
+          TEST_OUTPUT=$(cat test_output.log | tail -100)
+          
+          # Get the failing test file
+          FAILING_TEST=$(cat tests/test_calculator.py)
+          
+          # Get the source file
+          SOURCE_CODE=$(cat src/calculator.py)
+          
+          # Build the prompt with proper JSON escaping
+          jq -n \
+            --arg test_output "$TEST_OUTPUT" \
+            --arg test_file "$FAILING_TEST" \
+            --arg source "$SOURCE_CODE" \
+            '{
+              contents: [{
+                role: "user",
+                parts: [{
+                  text: ("You are a senior Python developer helping debug CI test failures.\n\n## TEST OUTPUT (showing failure):\n```\n" + $test_output + "\n```\n\n## TEST FILE (tests/test_calculator.py):\n```python\n" + $test_file + "\n```\n\n## SOURCE FILE (src/calculator.py):\n```python\n" + $source + "\n```\n\n## YOUR TASK:\n1. Identify the root cause of the test failure (1-2 sentences)\n2. Determine if this is a bug in the TEST or in the SOURCE CODE\n3. Provide the exact fix (show the corrected code)\n4. Explain how to prevent similar issues\n\nBe specific and actionable.")
+                }]
+              }],
+              generationConfig: {
+                temperature: 0.2,
+                maxOutputTokens: 2048
+              }
+            }' > request.json
+          
+          echo "Request size: $(wc -c < request.json) bytes"
+          echo "::endgroup::"
+          
+          echo "::group::🌐 Calling Vertex AI (Gemini)"
+          
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o response.json \
+            --max-time 60 \
+            --connect-timeout 10 \
+            -X POST \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @request.json \
+            "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/publishers/google/models/gemini-2.5-flash:generateContent")
+          
+          echo "HTTP Response Code: $HTTP_CODE"
+          echo "::endgroup::"
+          
+          # Check for errors
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Vertex AI API call failed with HTTP $HTTP_CODE"
+            echo "::group::Error Response"
+            cat response.json
+            echo "::endgroup::"
+            exit 1
+          fi
+          
+          if jq -e '.error' response.json > /dev/null 2>&1; then
+            echo "::error::API returned error: $(jq -r '.error.message' response.json)"
+            exit 1
+          fi
+          
+          # Extract the AI's analysis
+          ANALYSIS=$(jq -r '.candidates[0].content.parts[0].text // "No analysis returned"' response.json)
+          
+          # Create a nice summary
+          echo "::group::🤖 AI Analysis Result"
+          echo "$ANALYSIS"
+          echo "::endgroup::"
+          
+          # Write to GitHub Step Summary (appears on the workflow run page)
+          {
+            echo "## 🤖 AI Analysis of Test Failure"
+            echo ""
+            echo "**Repository:** \`${{ github.repository }}\`"
+            echo "**Commit:** \`${{ github.sha }}\`"
+            echo "**Branch:** \`${{ github.ref_name }}\`"
+            echo "**Triggered by:** @${{ github.actor }}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "$ANALYSIS"
+            echo ""
+            echo "---"
+            echo ""
+            echo "⚠️ *This analysis was generated by Google Gemini. Please review suggestions carefully before applying.*"
+          } >> $GITHUB_STEP_SUMMARY
+          
+          echo "✅ Analysis complete! Check the workflow summary for details."
