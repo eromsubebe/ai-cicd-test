@@ -82,7 +82,7 @@ jobs:
           
           # Option B: Workload Identity (for production)
           # Uncomment these and comment out credentials_json above:
-          workload_identity_provider: 'projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          workload_identity_provider: 'projects/220878759676/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
           service_account: 'github-actions-agent@eromsdevops-agent.iam.gserviceaccount.com'
           
           token_format: access_token
