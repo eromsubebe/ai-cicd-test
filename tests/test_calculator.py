@@ -65,4 +65,4 @@ class TestAverage:
     def test_average_intentional_failure(self):
         """This test has a bug - wrong expected value."""
         result = calculate_average([1, 2, 3])
-        assert result == 2.5, f"Expected 2.5 but got {result}"
+        assert result == 2.0, f"Expected 2.0 but got {result}"
